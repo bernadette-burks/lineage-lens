@@ -10,10 +10,11 @@
 <header><h1>Lineage Lens ♡</h1><p>A little place to preserve your family's memories.</p></header>
 <section class="panel">
 <div class="row"><div><strong>Preview before saving</strong><div class="muted">Review every memory before it goes to Drive.</div></div><button id="toggle" class="switch" role="switch" aria-label="Preview before saving" aria-checked="true"><span class="knob"></span></button></div>
+<div class="row" style="margin-top:20px;padding-top:18px;border-top:1px solid #f3dce5"><div><strong>Use Scanner Mode</strong><div class="muted">Auto-crop and straighten printed photos.</div></div><button id="scannerToggle" class="switch" role="switch" aria-label="Use Scanner Mode" aria-checked="false"><span class="knob"></span></button></div>
 </section>
 <section class="panel"><div class="tag">Google Drive</div><p id="driveStatus" class="status">Not connected. Connect your Google account to save photos.</p><button class="secondary" id="connect">Connect Google Drive</button><div class="muted small">Google will ask for permission to manage files this app creates or opens. Photos are uploaded only when you capture and save them.</div></section>
-<section class="panel"><div class="tag">Camera</div><p id="cameraStatus" class="status">Tap Start Camera to begin.</p><video id="video" class="hidden" autoplay playsinline muted></video><img id="preview" class="hidden" alt="Captured memory preview"><button class="primary" id="start">♡ Start Camera</button><button class="primary hidden" id="capture">♡ Capture memory</button><div class="actions"><button class="secondary hidden" id="retake">Retake</button><button class="primary hidden" id="save">Save to Drive ♡</button></div><button class="secondary" id="fallback">Select Photo Instead</button><input id="file" type="file" accept="image/*" capture="environment" class="hidden"></section>
-<section class="panel"><div class="muted">Photos are saved as <strong>00001.jpg, 00002.jpg…</strong> in your Lineage Lens Google Drive folder. Keep this tab open until the save confirmation appears. If a save fails, your photo stays available to retry.</div></section>
+<section class="panel"><div class="tag">Camera</div><p id="cameraStatus" class="status">Tap Start Camera to begin.</p><video id="video" class="hidden" autoplay playsinline muted></video><img id="preview" class="hidden" alt="Captured memory preview"><button class="primary" id="start">♡ Start Camera</button><button class="primary hidden" id="capture">♡ Capture memory</button><p id="scanStatus" class="status hidden" aria-live="polite"></p><div class="actions"><button class="secondary hidden" id="retake">Retake</button><button class="primary hidden" id="save">Save to Drive ♡</button></div><button class="secondary" id="fallback">Select Photo Instead</button><input id="file" type="file" accept="image/*" capture="environment" class="hidden"></section>
+<section class="panel"><div class="muted">Scanner Mode works best with a printed photo on a contrasting background, all four corners visible. When no safe crop is found, the original is saved. Photos are saved as <strong>00001.jpg, 00002.jpg…</strong> in your Lineage Lens Google Drive folder. Keep this tab open until the save confirmation appears. If a save fails, your photo stays available to retry.</div></section>
 <div id="toast" class="hidden" role="status" aria-live="polite"></div>
 </main>
 <script>
@@ -25,10 +26,16 @@ const FOLDER_NAME = 'Lineage Lens';
 const $ = id => document.getElementById(id);
 let stream=null,tokenClient=null,accessToken=null,tokenExpires=0,folderId=null,pendingBlob=null,busy=false,toastTimer;
 let previewEnabled=localStorage.getItem('lineagePreview')!=='false';
+let scannerEnabled=localStorage.getItem('lineageScanner')==='true';
+let scannerLoader=null;
+let originalBlob=null,wasCropped=false;
 function toast(message){const t=$('toast');t.textContent=message;t.classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.add('hidden'),3600)}
 function togglePreview(){previewEnabled=!previewEnabled;localStorage.setItem('lineagePreview',String(previewEnabled));updateToggle()}
 function updateToggle(){$('toggle').setAttribute('aria-checked',String(previewEnabled))}
 $('toggle').onclick=togglePreview;updateToggle();
+function updateScannerToggle(){$('scannerToggle').setAttribute('aria-checked',String(scannerEnabled))}
+$('scannerToggle').onclick=()=>{scannerEnabled=!scannerEnabled;localStorage.setItem('lineageScanner',String(scannerEnabled));updateScannerToggle();if(scannerEnabled)loadScanner().catch(()=>{});};
+updateScannerToggle();
 function configured(){return CLIENT_ID.includes('.apps.googleusercontent.com')&&!CLIENT_ID.startsWith('PASTE_')}
 function loadGoogle(){return new Promise((resolve,reject)=>{if(window.google?.accounts?.oauth2)return resolve();const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.async=true;s.onload=resolve;s.onerror=()=>reject(new Error('Could not load Google sign-in. Check your connection.'));document.head.append(s)})}
 async function connect(){if(!configured()){toast('Add your Google OAuth client ID to index.html first.');return}try{await loadGoogle();if(!tokenClient){tokenClient=google.accounts.oauth2.initTokenClient({client_id:CLIENT_ID,scope:SCOPES,callback:()=>{}})}await new Promise((resolve,reject)=>{tokenClient.callback=r=>{if(r.error)return reject(new Error(r.error));accessToken=r.access_token;tokenExpires=Date.now()+(Number(r.expires_in||3500)-60)*1000;folderId=null;$('driveStatus').textContent='Connected to Google Drive ✓';$('connect').textContent='Switch Account';resolve()};tokenClient.requestAccessToken({prompt:accessToken?'':'select_account'})});toast('Google Drive connected ♡')}catch(e){toast('Google sign-in failed: '+e.message)}}
@@ -38,16 +45,134 @@ function escapeQuery(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}
 async function getFolder(){if(folderId)return folderId;const q=`name = '${escapeQuery(FOLDER_NAME)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;const found=await drive('files?'+new URLSearchParams({q,fields:'files(id,name),nextPageToken',page_size:'100'}));if(found.files?.length){folderId=found.files[0].id;return folderId}const created=await drive('files?fields=id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:FOLDER_NAME,mimeType:'application/vnd.google-apps.folder'})});folderId=created.id;return folderId}
 async function nextFilename(parent){const key='lineageNextNumber';let n=Math.max(1,parseInt(localStorage.getItem(key)||'1',10)||1);for(let i=0;i<10000;i++,n++){const name=String(n).padStart(5,'0')+'.jpg';const q=`name = '${name}' and '${parent}' in parents and trashed = false`;const r=await drive('files?'+new URLSearchParams({q,fields:'files(id)',page_size:'1'}));if(!r.files?.length)return {name,n}}throw new Error('Could not find an unused filename.')}
 async function upload(blob,parent,name){const metadata={name,mimeType:'image/jpeg',parents:[parent]};const boundary='lineage_'+Math.random().toString(36).slice(2);const prefix=`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n--${boundary}\r\nContent-Type: image/jpeg\r\n\r\n`;const body=new Blob([prefix,blob,`\r\n--${boundary}--`],{type:'multipart/related; boundary='+boundary});const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',{method:'POST',headers:{Authorization:'Bearer '+accessToken,'Content-Type':'multipart/related; boundary='+boundary},body});if(!res.ok){let message='';try{message=(await res.json()).error?.message||''}catch{}throw new Error('Upload failed ('+res.status+') '+message)}return res.json()}
-async function save(){if(busy||!pendingBlob)return;if(!accessToken||Date.now()>=tokenExpires){toast('Connect Google Drive first. Your photo is still here.');$('driveStatus').textContent='Connect or reconnect Google Drive before saving.';$('save').classList.remove('hidden');return}busy=true;$('save').disabled=true;$('capture').disabled=true;$('cameraStatus').textContent='Uploading to Google Drive…';try{const parent=await getFolder();const {name,n}=await nextFilename(parent);const result=await upload(pendingBlob,parent,name);if(!result.id)throw new Error('Drive did not confirm a file ID.');localStorage.setItem('lineageNextNumber',String(n+1));pendingBlob=null;$('preview').src='';$('preview').classList.add('hidden');$('save').classList.add('hidden');$('retake').classList.add('hidden');$('cameraStatus').textContent=`Saved ${name} to Google Drive ✓`;toast(`Memory saved! ♡ ${name}`);if(stream){$('video').classList.remove('hidden');$('capture').classList.remove('hidden')}}catch(e){$('cameraStatus').textContent='Save not completed. Your photo is still available.';toast(e.message);$('save').classList.remove('hidden');$('retake').classList.remove('hidden')}finally{busy=false;$('save').disabled=false;$('capture').disabled=false}}
+async function save(){if(busy||!pendingBlob)return;if(!accessToken||Date.now()>=tokenExpires){toast('Connect Google Drive first. Your photo is still here.');$('driveStatus').textContent='Connect or reconnect Google Drive before saving.';$('save').classList.remove('hidden');return}busy=true;$('save').disabled=true;$('capture').disabled=true;$('cameraStatus').textContent='Uploading to Google Drive…';try{const parent=await getFolder();const {name,n}=await nextFilename(parent);const result=await upload(pendingBlob,parent,name);if(!result.id)throw new Error('Drive did not confirm a file ID.');localStorage.setItem('lineageNextNumber',String(n+1));pendingBlob=null;originalBlob=null;wasCropped=false;$('preview').src='';$('preview').classList.add('hidden');$('save').classList.add('hidden');$('retake').classList.add('hidden');$('cameraStatus').textContent=`Saved ${name} to Google Drive ✓`;toast(`Memory saved! ♡ ${name}`);if(stream){$('video').classList.remove('hidden');$('capture').classList.remove('hidden')}scanMessage('')}catch(e){$('cameraStatus').textContent='Save not completed. Your photo is still available.';toast(e.message);$('save').classList.remove('hidden');$('retake').classList.remove('hidden')}finally{busy=false;$('save').disabled=false;$('capture').disabled=false}}
 $('save').onclick=save;
-async function startCamera(){try{if(!navigator.mediaDevices?.getUserMedia)throw new Error('Live camera unavailable in this browser. Use the photo picker.');if(stream)stream.getTracks().forEach(t=>t.stop());stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:2560}}});$('video').srcObject=stream;await $('video').play();$('video').classList.remove('hidden');$('preview').classList.add('hidden');$('start').classList.add('hidden');$('capture').classList.remove('hidden');$('save').classList.add('hidden');$('retake').classList.add('hidden');$('cameraStatus').textContent='Frame your photograph, then tap Capture memory.'}catch(e){$('cameraStatus').textContent='Camera unavailable: '+e.message;toast('Try the photo picker below.')}}
+async function startCamera(){try{if(!navigator.mediaDevices?.getUserMedia)throw new Error('Live camera unavailable in this browser. Use the photo picker.');if(stream)stream.getTracks().forEach(t=>t.stop());stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:2560}}});$('video').srcObject=stream;await $('video').play();$('video').classList.remove('hidden');$('preview').classList.add('hidden');$('start').classList.add('hidden');$('capture').classList.remove('hidden');$('save').classList.add('hidden');$('retake').classList.add('hidden');scanMessage('');$('cameraStatus').textContent='Frame your photograph, then tap Capture memory.'}catch(e){$('cameraStatus').textContent='Camera unavailable: '+e.message;toast('Try the photo picker below.')}}
 $('start').onclick=startCamera;
 function processCanvas(canvas){return new Promise((resolve,reject)=>{canvas.toBlob(b=>b?resolve(b):reject(new Error('JPEG conversion failed.')),'image/jpeg',.92)})}
-async function capture(){if(busy)return;const v=$('video');if(!v.videoWidth){toast('Camera is still starting.');return}const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;const ctx=c.getContext('2d');ctx.filter='contrast(1.035) saturate(1.035) brightness(1.015)';ctx.drawImage(v,0,0,c.width,c.height);ctx.filter='none';await setPhoto(await processCanvas(c))}
+
+// OpenCV is loaded only when Scanner Mode is enabled; a failure never blocks saving.
+function loadScanner(){
+  if(window.cv?.Mat)return Promise.resolve(window.cv);
+  if(scannerLoader)return scannerLoader;
+  scannerLoader=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');
+    script.src='https://docs.opencv.org/4.10.0/opencv.js';
+    script.async=true;
+    script.onerror=()=>reject(new Error('Scanner library could not load'));
+    script.onload=async()=>{
+      try{
+        let cv=window.cv;
+        if(cv instanceof Promise)cv=await cv;
+        if(!cv?.Mat){
+          const start=Date.now();
+          while(!window.cv?.Mat && Date.now()-start<15000)await new Promise(r=>setTimeout(r,100));
+          cv=window.cv;
+        }
+        if(!cv?.Mat)throw new Error('Scanner library did not initialize');
+        resolve(cv);
+      }catch(e){reject(e)}
+    };
+    document.head.append(script);
+  }).catch(e=>{scannerLoader=null;throw e});
+  return scannerLoader;
+}
+function scanMessage(message){$('scanStatus').textContent=message;$('scanStatus').classList.toggle('hidden',!message)}
+function distance(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function orderCorners(points){
+  // top-left, top-right, bottom-right, bottom-left
+  const sums=points.map(p=>p.x+p.y),diffs=points.map(p=>p.y-p.x);
+  const indexes=[sums.indexOf(Math.min(...sums)),diffs.indexOf(Math.min(...diffs)),sums.indexOf(Math.max(...sums)),diffs.indexOf(Math.max(...diffs))];
+  if(new Set(indexes).size!==4)return null;
+  return indexes.map(i=>points[i]);
+}
+function autoCropCanvas(canvas,cv){
+  // Analyze a downscaled copy, then warp the full-resolution canvas.
+  const small=document.createElement('canvas');
+  const scale=Math.min(1,960/Math.max(canvas.width,canvas.height));
+  small.width=Math.max(1,Math.round(canvas.width*scale));
+  small.height=Math.max(1,Math.round(canvas.height*scale));
+  small.getContext('2d').drawImage(canvas,0,0,small.width,small.height);
+  const mats=[];
+  const keep=m=>{mats.push(m);return m};
+  try{
+    const src=keep(cv.imread(small)),gray=keep(new cv.Mat()),blur=keep(new cv.Mat()),edges=keep(new cv.Mat());
+    const contours=keep(new cv.MatVector()),hierarchy=keep(new cv.Mat());
+    cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray,blur,new cv.Size(5,5),0);
+    cv.Canny(blur,edges,55,155);
+    cv.findContours(edges,contours,hierarchy,cv.RETR_LIST,cv.CHAIN_APPROX_SIMPLE);
+    let best=null;
+    const imageArea=small.width*small.height;
+    for(let i=0;i<contours.size();i++){
+      const contour=contours.get(i);
+      try{
+        const perimeter=cv.arcLength(contour,true);
+        const poly=new cv.Mat();
+        try{
+          cv.approxPolyDP(contour,poly,0.025*perimeter,true);
+          if(poly.rows!==4 || !cv.isContourConvex(poly))continue;
+          const area=Math.abs(cv.contourArea(poly));
+          // Reject tiny rectangles and a detected frame matching the whole image.
+          if(area<imageArea*.18 || area>imageArea*.91)continue;
+          const raw=[];
+          for(let k=0;k<4;k++)raw.push({x:poly.data32S[k*2],y:poly.data32S[k*2+1]});
+          const points=orderCorners(raw);
+          if(!points)continue;
+          const [tl,tr,br,bl]=points;
+          const w=Math.max(distance(tl,tr),distance(bl,br));
+          const h=Math.max(distance(tl,bl),distance(tr,br));
+          if(w<small.width*.22 || h<small.height*.18)continue;
+          const ratio=w/h;
+          if(ratio<.42 || ratio>2.5)continue;
+          const margin=Math.min(small.width,small.height)*.012;
+          if(points.some(p=>p.x<margin||p.y<margin||p.x>small.width-margin||p.y>small.height-margin))continue;
+          if(!best || area>best.area)best={area,points,w,h};
+        }finally{poly.delete()}
+      }finally{contour.delete()}
+    }
+    if(!best)return null;
+    const invX=canvas.width/small.width,invY=canvas.height/small.height;
+    const p=best.points.map(pt=>({x:pt.x*invX,y:pt.y*invY}));
+    const outW=Math.max(1,Math.round(Math.max(distance(p[0],p[1]),distance(p[3],p[2]))));
+    const outH=Math.max(1,Math.round(Math.max(distance(p[0],p[3]),distance(p[1],p[2]))));
+    if(outW*outH>18000000)return null; // avoid huge allocations on iOS
+    const source=keep(cv.imread(canvas));
+    const srcPoints=keep(cv.matFromArray(4,1,cv.CV_32FC2,p.flatMap(pt=>[pt.x,pt.y])));
+    const dstPoints=keep(cv.matFromArray(4,1,cv.CV_32FC2,[0,0,outW-1,0,outW-1,outH-1,0,outH-1]));
+    const matrix=keep(cv.getPerspectiveTransform(srcPoints,dstPoints));
+    const result=keep(new cv.Mat());
+    cv.warpPerspective(source,result,matrix,new cv.Size(outW,outH),cv.INTER_LINEAR,cv.BORDER_REPLICATE);
+    const output=document.createElement('canvas');output.width=outW;output.height=outH;
+    cv.imshow(output,result);
+    return output;
+  }finally{for(let i=mats.length-1;i>=0;i--)mats[i].delete()}
+}
+async function preparePhoto(canvas){
+  const fullBlob=await processCanvas(canvas);
+  originalBlob=fullBlob;wasCropped=false;
+  if(!scannerEnabled){scanMessage('');return fullBlob}
+  scanMessage('Scanner Mode: looking for photo edges…');
+  try{
+    const cv=await loadScanner();
+    const cropped=autoCropCanvas(canvas,cv);
+    if(!cropped){scanMessage('Scanner Mode: edges unclear, so the full photo was kept.');return fullBlob}
+    const croppedBlob=await processCanvas(cropped);
+    wasCropped=true;
+    scanMessage('Scanner Mode: photo cropped and straightened ✓');
+    return croppedBlob;
+  }catch(e){
+    console.warn('Scanner unavailable; preserving original:',e);
+    scanMessage('Scanner unavailable; the full photo was kept.');
+    return fullBlob;
+  }
+}
+
+async function capture(){if(busy)return;busy=true;$('capture').disabled=true;try{const v=$('video');if(!v.videoWidth){toast('Camera is still starting.');return}const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;const ctx=c.getContext('2d');ctx.filter='contrast(1.035) saturate(1.035) brightness(1.015)';ctx.drawImage(v,0,0,c.width,c.height);ctx.filter='none';const photo=await preparePhoto(c);busy=false;await setPhoto(photo)}finally{busy=false;$('capture').disabled=false}}
 $('capture').onclick=()=>capture().catch(e=>toast(e.message));
 async function setPhoto(blob){pendingBlob=blob;const url=URL.createObjectURL(blob);$('preview').onload=()=>URL.revokeObjectURL(url);$('preview').src=url;$('preview').classList.remove('hidden');$('video').classList.add('hidden');$('capture').classList.add('hidden');$('retake').classList.remove('hidden');$('save').classList.toggle('hidden',!previewEnabled);$('cameraStatus').textContent=previewEnabled?'Review your memory, then save or retake.':'Preview off: saving automatically…';if(!previewEnabled)await save()}
-$('retake').onclick=()=>{pendingBlob=null;$('preview').classList.add('hidden');$('retake').classList.add('hidden');$('save').classList.add('hidden');if(stream){$('video').classList.remove('hidden');$('capture').classList.remove('hidden');$('cameraStatus').textContent='Ready for another photo.'}else{$('start').classList.remove('hidden');$('cameraStatus').textContent='Take or choose another photo.'}};
+$('retake').onclick=()=>{pendingBlob=null;originalBlob=null;wasCropped=false;scanMessage('');$('preview').classList.add('hidden');$('retake').classList.add('hidden');$('save').classList.add('hidden');if(stream){$('video').classList.remove('hidden');$('capture').classList.remove('hidden');$('cameraStatus').textContent='Ready for another photo.'}else{$('start').classList.remove('hidden');$('cameraStatus').textContent='Take or choose another photo.'}};
 $('fallback').onclick=()=>$('file').click();
-$('file').onchange=async e=>{const f=e.target.files?.[0];if(!f)return;try{const bmp=await createImageBitmap(f,{imageOrientation:'from-image'});const max=3000,scale=Math.min(1,max/Math.max(bmp.width,bmp.height));const c=document.createElement('canvas');c.width=Math.round(bmp.width*scale);c.height=Math.round(bmp.height*scale);const ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);ctx.filter='contrast(1.035) saturate(1.035) brightness(1.015)';ctx.drawImage(bmp,0,0,c.width,c.height);bmp.close();await setPhoto(await processCanvas(c))}catch(err){toast('Could not process photo: '+err.message)}finally{e.target.value=''}};
+$('file').onchange=async e=>{const f=e.target.files?.[0];if(!f)return;if(busy){toast('Please wait for the current save.');return}try{const bmp=await createImageBitmap(f,{imageOrientation:'from-image'});const max=3000,scale=Math.min(1,max/Math.max(bmp.width,bmp.height));const c=document.createElement('canvas');c.width=Math.round(bmp.width*scale);c.height=Math.round(bmp.height*scale);const ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);ctx.filter='contrast(1.035) saturate(1.035) brightness(1.015)';ctx.drawImage(bmp,0,0,c.width,c.height);bmp.close();await setPhoto(await preparePhoto(c))}catch(err){toast('Could not process photo: '+err.message)}finally{e.target.value=''}};
 window.addEventListener('pagehide',()=>{if(stream)stream.getTracks().forEach(t=>t.stop())});
 </script></body></html>
