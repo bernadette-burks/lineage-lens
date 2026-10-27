@@ -1,2 +1,2 @@
-# LineageLens 👨‍👩‍👧‍👦👩‍👧‍👦👪
-Mom's Birthday App Built with ChatGPT Using HTML, CSS, and JS 📸
+# Lineage Lens 👨‍👩‍👧‍👦👩‍👧‍👦👪
+App Built with ChatGPT Using HTML, CSS, and JS | Hosted via GitHub Pages 📸
